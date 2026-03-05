@@ -58,22 +58,21 @@ async def list_dashboards(req: LookerAuthRequest):
 
 @app.post("/looker/preview")
 async def preview_dashboard(req: Dict[str, str]):
-    """Page 2 -> Page 3: Fetches specific dashboard metadata and detected views."""
     try:
+        # Get the full unified schema
         unified_schema = transform_looker_to_unified(
             dashboard_id=req['looker_id'],
             client_id=req['looker_client_id'],
             client_secret=req['looker_client_secret'],
             base_url=req['looker_url']
         )
-        views = [ds['name'] for ds in unified_schema.get('datasets', [])]
         return {
             "dashboard_name": unified_schema['source']['dashboardName'],
-            "views": views
+            "visuals": unified_schema['pages'][0]['visuals'], # Full list of charts
+            "looker_datasets": unified_schema['datasets']    # List of views used
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 @app.post("/migrate")
 async def run_migration(req: MigrationRequest):
     """Page 3: Executes the migration cards to Domo."""
@@ -118,4 +117,5 @@ async def run_migration(req: MigrationRequest):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
