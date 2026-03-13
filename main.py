@@ -4,14 +4,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, List, Optional
 
-# Import your custom logic
+# Import your custom logic (Keep these files as they are)
 from looker_to_unified_schema import transform_looker_to_unified, LookerClient
-from domo_client import DomoClient
 from domo_adapter import DomoAdapter
 from dataset_resolver import StaticDatasetResolver
 
-app = FastAPI(title="Looker to Domo Migration API")
+app = FastAPI(title="Looker to Domo Migration Payload Generator")
 
+# Enable CORS for Domo environment
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,6 +19,18 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# --- Helper Class: Config Collector ---
+# This class "tricks" the DomoAdapter into giving us the JSON 
+# instead of actually trying to send it to Domo.
+class ConfigCollector:
+    def __init__(self):
+        self.configs = []
+
+    def create_card(self, page_id, payload):
+        """Instead of calling an API, we just save the payload to a list."""
+        self.configs.append(payload)
+        return {"id": "pending_deployment"}
 
 # --- Request Models ---
 
@@ -33,17 +45,15 @@ class MigrationRequest(BaseModel):
     looker_client_id: str
     looker_client_secret: str
     domo_page_id: str
-    domo_cookie: str
-    domo_csrf: str
     dataset_mapping: Dict[str, str]
-    # ✅ NEW: only migrate the charts the user checked in the UI
     selected_visual_ids: Optional[List[str]] = None
+    # NOTE: domo_cookie and domo_csrf are REMOVED as they are no longer needed.
 
 # --- Endpoints ---
 
 @app.post("/looker/dashboards")
 async def list_dashboards(req: LookerAuthRequest):
-    """Page 1 -> Page 2: Fetches all dashboards from Looker."""
+    """Fetches all dashboards from Looker for the dropdown list."""
     try:
         client = LookerClient(req.looker_client_id, req.looker_client_secret, req.looker_url)
         if not client.token:
@@ -61,6 +71,7 @@ async def list_dashboards(req: LookerAuthRequest):
 
 @app.post("/looker/preview")
 async def preview_dashboard(req: Dict[str, str]):
+    """Provides the data for the table on Page 3 (Titles, Types, Calcs)."""
     try:
         unified_schema = transform_looker_to_unified(
             dashboard_id=req['looker_id'],
@@ -70,7 +81,7 @@ async def preview_dashboard(req: Dict[str, str]):
         )
         return {
             "dashboard_name": unified_schema['source']['dashboardName'],
-            "visuals": unified_schema['pages'][0]['visuals'],  # Full list of charts shown in UI
+            "visuals": unified_schema['pages'][0]['visuals'], 
             "looker_datasets": unified_schema["datasets"],
             "calculatedFields": unified_schema.get("calculatedFields", [])
         }
@@ -78,10 +89,15 @@ async def preview_dashboard(req: Dict[str, str]):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/migrate")
-async def run_migration(req: MigrationRequest):
-    """Page 3: Executes the migration — only for charts the user selected."""
+@app.post("/get-migration-payloads")
+async def get_migration_payloads(req: MigrationRequest):
+    """
+    NEW ENDPOINT: 
+    Converts Looker charts into Domo JSON 'configs'.
+    Does not call Domo. Returns configs to the React Frontend.
+    """
     try:
+        # 1. Generate Unified Schema from Looker
         unified_schema = transform_looker_to_unified(
             dashboard_id=req.looker_id,
             client_id=req.looker_client_id,
@@ -89,7 +105,7 @@ async def run_migration(req: MigrationRequest):
             base_url=req.looker_url
         )
 
-        # ✅ Filter to only the visuals the user checked in the UI
+        # 2. Filter visuals to only the CHECKED boxes in the UI
         if req.selected_visual_ids is not None:
             selected_set = set(req.selected_visual_ids)
             for page in unified_schema.get("pages", []):
@@ -97,17 +113,8 @@ async def run_migration(req: MigrationRequest):
                     v for v in page.get("visuals", [])
                     if v.get("id") in selected_set
                 ]
-            print(f"✅ Migrating {sum(len(p['visuals']) for p in unified_schema['pages'])} "
-                  f"chart(s) selected by user.")
 
-        domo_headers = {
-            "Content-Type": "application/json;charset=UTF-8",
-            "x-requested-with": "XMLHttpRequest",
-            "x-csrf-token": req.domo_csrf,
-            "Cookie": req.domo_cookie
-        }
-        domo_client = DomoClient(base_url="https://gwcteq-partner.domo.com", headers=domo_headers)
-
+        # 3. Setup Dataset Resolver (maps Looker views to Domo UUIDs)
         dynamic_resolver_map = {}
         for ds in unified_schema.get("datasets", []):
             internal_id = ds["id"]
@@ -120,17 +127,28 @@ async def run_migration(req: MigrationRequest):
             raise Exception("No valid dataset mappings were found.")
 
         resolver = StaticDatasetResolver(dynamic_resolver_map)
-        adapter = DomoAdapter(domo_client, resolver, column_mapping={})
-        results = adapter.deploy_dashboard(unified_schema, req.domo_page_id)
 
+        # 4. Generate the Card JSON Payloads
+        # We use ConfigCollector instead of DomoClient to capture the JSON
+        collector = ConfigCollector()
+        adapter = DomoAdapter(collector, resolver, column_mapping={})
+        
+        # This will populate collector.configs
+        adapter.deploy_dashboard(unified_schema, req.domo_page_id)
+
+        # 5. Return the configs to the Frontend
         return {
             "status": "success",
-            "results": results
+            "domo_page_id": req.domo_page_id,
+            "card_configs": collector.configs
         }
+
     except Exception as e:
+        print(f"Error generating payloads: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
     import uvicorn
+    # Make sure port 8000 is open on Render
     uvicorn.run(app, host="0.0.0.0", port=8000)
