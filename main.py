@@ -1,78 +1,135 @@
 import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Dict, Any, List
+from typing import Dict, List, Optional
 
+# Import your custom logic
 from looker_to_unified_schema import transform_looker_to_unified, LookerClient
+from domo_client import DomoClient
 from domo_adapter import DomoAdapter
 from dataset_resolver import StaticDatasetResolver
 
-app = FastAPI(title="Looker to Domo Payload API")
+app = FastAPI(title="Looker to Domo Migration API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
+
+# --- Request Models ---
 
 class LookerAuthRequest(BaseModel):
     looker_url: str
     looker_client_id: str
     looker_client_secret: str
 
-class PayloadRequest(BaseModel):
+class MigrationRequest(BaseModel):
     looker_url: str
     looker_id: str
     looker_client_id: str
     looker_client_secret: str
+    domo_page_id: str
+    domo_cookie: str
+    domo_csrf: str
     dataset_mapping: Dict[str, str]
+    # ✅ NEW: only migrate the charts the user checked in the UI
+    selected_visual_ids: Optional[List[str]] = None
 
-@app.options("/{full_path:path}")
-async def preflight_handler(request: Request, full_path: str):
-    response = JSONResponse(content="OK")
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "*"
-    return response
+# --- Endpoints ---
 
 @app.post("/looker/dashboards")
 async def list_dashboards(req: LookerAuthRequest):
+    """Page 1 -> Page 2: Fetches all dashboards from Looker."""
     try:
         client = LookerClient(req.looker_client_id, req.looker_client_secret, req.looker_url)
+        if not client.token:
+            raise HTTPException(status_code=401, detail="Looker Authentication Failed")
+
         url = f"{req.looker_url.rstrip('/')}/api/4.0/dashboards"
-        res = requests.get(url, headers={'Authorization': f'token {client.token}'}, timeout=60)
-        return [{"id": str(d["id"]), "title": d["title"]} for d in res.json()]
+        headers = {'Authorization': f'token {client.token}'}
+        response = requests.get(url, headers=headers, timeout=60)
+        response.raise_for_status()
+
+        return [{"id": str(d["id"]), "title": d["title"]} for d in response.json()]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/looker/preview")
-async def preview_dashboard(req: Dict[str, Any]):
+async def preview_dashboard(req: Dict[str, str]):
     try:
-        unified = transform_looker_to_unified(req['looker_id'], req['looker_client_id'], req['looker_client_secret'], req['looker_url'])
-        return {"dashboard_name": unified['source']['dashboardName'], "visuals": unified['pages'][0]['visuals'], "looker_datasets": unified['datasets']}
+        unified_schema = transform_looker_to_unified(
+            dashboard_id=req['looker_id'],
+            client_id=req['looker_client_id'],
+            client_secret=req['looker_client_secret'],
+            base_url=req['looker_url']
+        )
+        return {
+            "dashboard_name": unified_schema['source']['dashboardName'],
+            "visuals": unified_schema['pages'][0]['visuals'],  # Full list of charts shown in UI
+            "looker_datasets": unified_schema["datasets"],
+            "calculatedFields": unified_schema.get("calculatedFields", [])
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/prepare-payloads")
-async def prepare_payloads(req: PayloadRequest):
-    """Generates Domo JSON payloads for React to deploy via browser session."""
+
+@app.post("/migrate")
+async def run_migration(req: MigrationRequest):
+    """Page 3: Executes the migration — only for charts the user selected."""
     try:
-        unified = transform_looker_to_unified(req.looker_id, req.looker_client_id, req.looker_client_secret, req.looker_url)
-        
-        # Bridge the View Names to the provided Domo IDs
-        dynamic_map = {}
-        for ds in unified['datasets']:
-            domo_uuid = req.dataset_mapping.get(ds['name'])
-            if domo_uuid: dynamic_map[ds['id']] = domo_uuid
-        
-        resolver = StaticDatasetResolver(dynamic_map)
-        adapter = DomoAdapter(domo_client=None, dataset_resolver=resolver)
-        
-        payloads = adapter.get_all_payloads(unified)
-        return {"status": "success", "payloads": payloads}
+        unified_schema = transform_looker_to_unified(
+            dashboard_id=req.looker_id,
+            client_id=req.looker_client_id,
+            client_secret=req.looker_client_secret,
+            base_url=req.looker_url
+        )
+
+        # ✅ Filter to only the visuals the user checked in the UI
+        if req.selected_visual_ids is not None:
+            selected_set = set(req.selected_visual_ids)
+            for page in unified_schema.get("pages", []):
+                page["visuals"] = [
+                    v for v in page.get("visuals", [])
+                    if v.get("id") in selected_set
+                ]
+            print(f"✅ Migrating {sum(len(p['visuals']) for p in unified_schema['pages'])} "
+                  f"chart(s) selected by user.")
+
+        domo_headers = {
+            "Content-Type": "application/json;charset=UTF-8",
+            "x-requested-with": "XMLHttpRequest",
+            "x-csrf-token": req.domo_csrf,
+            "Cookie": req.domo_cookie
+        }
+        domo_client = DomoClient(base_url="https://gwcteq-partner.domo.com", headers=domo_headers)
+
+        dynamic_resolver_map = {}
+        for ds in unified_schema.get("datasets", []):
+            internal_id = ds["id"]
+            view_name = ds["name"]
+            domo_uuid = req.dataset_mapping.get(view_name)
+            if domo_uuid:
+                dynamic_resolver_map[internal_id] = domo_uuid
+
+        if not dynamic_resolver_map:
+            raise Exception("No valid dataset mappings were found.")
+
+        resolver = StaticDatasetResolver(dynamic_resolver_map)
+        adapter = DomoAdapter(domo_client, resolver, column_mapping={})
+        results = adapter.deploy_dashboard(unified_schema, req.domo_page_id)
+
+        return {
+            "status": "success",
+            "results": results
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
